@@ -1,5 +1,11 @@
 # cicd-okta-demo
 
+> **Disclaimer**: This is a public demo repository used for a lunch-and-learn
+> on CI/CD and Git. All group names, app names, and configuration are
+> fictional. It is not connected to any customer tenant, employer
+> environment, or production Okta org. Nothing here constitutes real-world
+> access or configuration.
+
 A tiny, deliberately-small demonstration repo for a lunch-and-learn on Git + CI/CD + Terraform, built around a single fictional Okta change.
 
 ## The scenario
