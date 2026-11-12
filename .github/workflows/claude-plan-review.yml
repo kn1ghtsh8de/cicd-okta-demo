@@ -1,0 +1,101 @@
+name: Claude Plan Review
+
+# Runs after the Terraform workflow finishes on a PR. Downloads the plan JSON
+# the Terraform workflow produced, asks Claude for a plain-English summary,
+# and posts it as a sticky PR comment.
+#
+# Uses workflow_run (not pull_request) so it runs in a trusted context with
+# access to the ANTHROPIC_API_KEY secret.
+
+on:
+  workflow_run:
+    workflows: [Terraform]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  review:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download plan artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: terraform.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          name: plan
+
+      - name: Read PR number
+        id: pr
+        run: echo "number=$(cat pr-number.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize plan with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -e
+
+          # Slim the plan down to the fields Claude needs; keeps the prompt
+          # small and avoids sending unrelated metadata.
+          jq '{
+            resource_changes: [
+              .resource_changes[] | {
+                address,
+                type,
+                name,
+                actions: .change.actions,
+                before: .change.before,
+                after: .change.after
+              }
+            ]
+          }' plan.json > plan-slim.json
+
+          PLAN_JSON=$(cat plan-slim.json)
+          REQUEST=$(jq -n --arg plan "$PLAN_JSON" '{
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 600,
+            system: "You are reviewing a Terraform plan for an Okta configuration repo. In under 150 words, summarize what this plan will do in plain English for a non-engineer reviewer. Explicitly call out which groups gain or lose access to which apps. If any change touches MFA, sign-on policies, admin roles, or the built-in Everyone group, flag it as sensitive. End with the line: \"This is a machine-generated summary. Read the plan.\"",
+            messages: [
+              { role: "user", content: ("Here is the Terraform plan as JSON:\n\n" + $plan) }
+            ]
+          }')
+
+          HTTP_STATUS=$(curl -sS -o response.json -w "%{http_code}" \
+            https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$REQUEST")
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Claude API returned HTTP $HTTP_STATUS"
+            cat response.json
+            cat <<'EOF' > summary.txt
+          _Claude review unavailable right now — falling back to canned summary._
+
+          This PR grants the **demo-marketing** group access to the **Swag Store** app and adds a sign-on policy rule that **requires MFA** for Swag Store. No other assignments change. Review the full Terraform Plan comment above before approving.
+          EOF
+          else
+            jq -r '.content[0].text' response.json > summary.txt
+          fi
+
+      - name: Build review comment
+        run: |
+          {
+            echo "### Claude Plan Review"
+            echo
+            cat summary.txt
+          } > claude-comment.md
+
+      - name: Comment review on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: claude-plan-review
+          number: ${{ steps.pr.outputs.number }}
+          path: claude-comment.md

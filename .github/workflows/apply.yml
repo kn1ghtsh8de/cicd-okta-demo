@@ -1,0 +1,49 @@
+name: Terraform Apply
+
+# This workflow is deliberately NOT triggered by PR events.
+# It can only be fired manually via workflow_dispatch and every run must be
+# approved by a reviewer on the "production" GitHub Environment.
+#
+# For the lunch-and-learn we show that this workflow exists and is gated,
+# then stop. We do not run it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # TFC is in local-execution mode, so pass Okta creds from GitHub secrets.
+  OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+  OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+  OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+
+jobs:
+  apply:
+    if: inputs.confirm == 'APPLY'
+    name: terraform apply
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform init
+
+      - name: Apply
+        run: terraform apply -auto-approve

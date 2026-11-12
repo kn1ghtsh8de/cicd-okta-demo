@@ -1,0 +1,151 @@
+name: Terraform
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # The Okta provider reads these from the process environment. The TFC
+  # workspace is in local-execution mode, so TFC workspace variables are NOT
+  # injected into the runner — we have to pass them in from GitHub secrets.
+  OKTA_ORG_NAME: ${{ secrets.OKTA_ORG_NAME }}
+  OKTA_BASE_URL: ${{ secrets.OKTA_BASE_URL }}
+  OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
+
+jobs:
+  validate:
+    name: fmt / init / validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: terraform init
+
+      - name: Validate
+        run: terraform validate -no-color
+
+  plan:
+    name: plan
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Init
+        run: terraform init
+
+      - name: Plan (text)
+        run: terraform plan -no-color -out=tfplan | tee plan.txt
+
+      - name: Plan (JSON)
+        run: terraform show -json tfplan > plan.json
+
+      - name: Record PR number
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: |
+            plan.json
+            plan.txt
+            pr-number.txt
+          retention-days: 1
+
+      - name: Build plan comment
+        run: |
+          {
+            echo "### Terraform Plan"
+            echo
+            echo "<details><summary>Click to expand</summary>"
+            echo
+            echo '```hcl'
+            head -c 60000 plan.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > plan-comment.md
+
+      - name: Comment plan on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: terraform-plan
+          path: plan-comment.md
+
+  policy-check:
+    name: policy check (conftest)
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+
+      - name: Install Conftest
+        run: |
+          CONFTEST_VERSION=0.56.0
+          curl -sSL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz conftest
+          sudo mv conftest /usr/local/bin/
+
+      - name: Run policies
+        id: conftest
+        continue-on-error: true
+        run: |
+          set +e
+          conftest test plan.json --policy policies/ --no-color 2>&1 | tee conftest.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Build policy comment
+        if: always()
+        run: |
+          if [ "${{ steps.conftest.outputs.exit_code }}" = "0" ]; then
+            STATUS="✅ Passed"
+          else
+            STATUS="❌ Failed"
+          fi
+          {
+            echo "### Policy Check — $STATUS"
+            echo
+            echo '```'
+            cat conftest.txt
+            echo '```'
+          } > policy-comment.md
+
+      - name: Comment policy results on PR
+        if: always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: policy-check
+          path: policy-comment.md
+
+      - name: Fail if policies denied
+        run: exit ${{ steps.conftest.outputs.exit_code }}
